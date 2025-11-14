@@ -2,17 +2,17 @@
 import asyncio
 import logging
 import aiosqlite
+from io import BytesIO
 from typing import Dict
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, InputChatUploadedPhoto
 from telethon.tl.functions.channels import (
     CreateForumTopicRequest,
     GetForumTopicsRequest,
     GetFullChannelRequest,
     CreateChannelRequest,
-    EditPhotoRequest,
-    EditAboutRequest
+    EditPhotoRequest
 )
 from telethon.errors import (
     FloodWaitError,
@@ -582,7 +582,6 @@ class WorkerBot:
 
                     # 슈퍼그룹/메가그룹
                     source_title = source_entity.title
-                    source_about = await self.client.get_entity(self.source)
                     full_chat = await self.client(GetFullChannelRequest(channel=source_entity))
                     source_about = full_chat.full_chat.about or ""
 
@@ -594,26 +593,31 @@ class WorkerBot:
                 else:
                     return await event.reply("❌ 소스가 그룹이 아닙니다")
 
+                # 설명 텍스트 포맷팅
+                description_text = source_about[:100] + "..." if source_about and len(source_about) > 100 else source_about if source_about else "(없음)"
+
                 await event.reply(
                     f"📋 복사할 그룹 정보:\n\n"
                     f"**제목:** {source_title}\n"
-                    f"**설명:** {source_about[:100]}..." if source_about else "**설명:** (없음)\n"
+                    f"**설명:** {description_text}"
                 )
 
                 # 2. 새 그룹 생성
-                from telethon.tl.functions.messages import CreateChatRequest
-                from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest, EditAboutRequest
-
-                me = await self.client.get_me()
+                # 제목 길이 제한 (Telegram 최대 255자)
+                if len(source_title) > 255:
+                    source_title = source_title[:252] + "..."
 
                 # 슈퍼그룹 생성 (메가그룹)
                 result = await self.client(CreateChannelRequest(
                     title=source_title,
-                    about=source_about,
+                    about=source_about[:255] if source_about else "",  # about도 길이 제한
                     megagroup=True  # 슈퍼그룹으로 생성
                 ))
 
                 # 생성된 채널 정보
+                if not result.chats:
+                    raise ValueError("그룹 생성 실패: 결과에 채팅이 없습니다")
+
                 new_group = result.chats[0]
                 new_group_id = new_group.id
 
@@ -622,13 +626,16 @@ class WorkerBot:
                 # 3. 프로필 사진 복사 (선택적)
                 try:
                     # 소스 프로필 사진 다운로드
-                    photo = await self.client.download_profile_photo(self.source, file=bytes)
+                    photo_bytes = BytesIO()
+                    photo = await self.client.download_profile_photo(self.source, file=photo_bytes)
                     if photo:
                         # 새 그룹에 업로드
-                        uploaded = await self.client.upload_file(photo)
+                        photo_bytes.seek(0)
+                        uploaded_file = await self.client.upload_file(photo_bytes)
+                        input_photo = InputChatUploadedPhoto(uploaded_file)
                         await self.client(EditPhotoRequest(
                             channel=new_group,
-                            photo=uploaded
+                            photo=input_photo
                         ))
                         await event.reply("✅ 프로필 사진 복사 완료")
                 except Exception as e:
@@ -679,7 +686,7 @@ class WorkerBot:
             # 미러링 비활성 또는 소스 불일치 시 무시
             if not self.mirroring_active:
                 return
-            if not self.source or e.chat_id != self.source.id:
+            if not self.source or not self.target or e.chat_id != self.source.id:
                 return
             # Album 메시지는 on_album에서 처리
             if e.message.grouped_id:
@@ -729,7 +736,7 @@ class WorkerBot:
             """영구 Album 핸들러 (중복 등록 방지)"""
             if not self.mirroring_active:
                 return
-            if not self.source or e.chat_id != self.source.id:
+            if not self.source or not self.target or e.chat_id != self.source.id:
                 return
 
             try:
@@ -792,7 +799,7 @@ class WorkerBot:
             """영구 MessageDeleted 핸들러 (중복 등록 방지)"""
             if not self.mirroring_active:
                 return
-            if not self.source or e.chat_id != self.source.id:
+            if not self.source or not self.target or e.chat_id != self.source.id:
                 return
 
             # 소스 ID → 타겟 ID 변환 (DB에서 조회)
@@ -811,8 +818,14 @@ class WorkerBot:
                 try:
                     await self.client.delete_messages(self.target, target_ids)
                     logger.info(f"🗑️ 메시지 삭제 완료: {len(target_ids)}개")
+                except FloodWaitError as fw:
+                    logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
+                    await asyncio.sleep(fw.seconds)
+                    await self.client.delete_messages(self.target, target_ids)
+                    logger.info(f"🗑️ 메시지 삭제 완료 (재시도): {len(target_ids)}개")
                 except Exception as ex:
-                    logger.warning(f"⚠️ 삭제 동기화 실패: {ex}")
+                    logger.error(f"❌ 삭제 동기화 실패: {ex}", exc_info=True)
+                    await self.log(f"삭제 동기화 실패: {ex}", "ERROR")
             else:
                 logger.debug(f"⚠️ 삭제할 메시지 매핑 없음: {e.deleted_ids}")
 
@@ -821,7 +834,7 @@ class WorkerBot:
             """영구 MessageEdited 핸들러 (중복 등록 방지)"""
             if not self.mirroring_active:
                 return
-            if not self.source or e.chat_id != self.source.id:
+            if not self.source or not self.target or e.chat_id != self.source.id:
                 return
 
             # 소스 ID → 타겟 ID 변환 (DB에서 조회)
@@ -841,8 +854,20 @@ class WorkerBot:
                         e.message.text
                     )
                     logger.info(f"✏️ 메시지 편집 완료: {source_id} → {target_id}")
+                except FloodWaitError as fw:
+                    logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
+                    await asyncio.sleep(fw.seconds)
+                    await self.client.edit_message(
+                        self.target,
+                        target_id,
+                        e.message.text
+                    )
+                    logger.info(f"✏️ 메시지 편집 완료 (재시도): {source_id} → {target_id}")
+                except MessageIdInvalidError:
+                    logger.warning(f"⚠️ 편집할 메시지 없음: {target_id}")
                 except Exception as ex:
-                    logger.warning(f"⚠️ 편집 동기화 실패: {ex}")
+                    logger.error(f"❌ 편집 동기화 실패: {ex}", exc_info=True)
+                    await self.log(f"편집 동기화 실패 (#{source_id}): {ex}", "ERROR")
             else:
                 # 미디어 메시지 편집은 Telegram API 제한으로 지원 안됨
                 logger.debug(f"⚠️ 미디어 메시지 편집 불가: {source_id}")
@@ -876,10 +901,7 @@ class WorkerBot:
         target_chat_id = str(self.target.id) if hasattr(self.target, 'id') else str(self.target)
 
         try:
-            # 먼저 메모리 캐시에 저장 (빠른 조회)
-            self.message_map[source_msg_id] = target_msg_id
-
-            # DB에 영구 저장
+            # DB에 먼저 저장 (원자성 보장)
             async with aiosqlite.connect(DATABASE_PATH) as db:
                 await db.execute(
                     """
@@ -890,8 +912,13 @@ class WorkerBot:
                     (self.worker_id, source_chat_id, target_chat_id, source_msg_id, target_msg_id)
                 )
                 await db.commit()
+
+            # DB 저장 성공 후에만 메모리 캐시 업데이트
+            self.message_map[source_msg_id] = target_msg_id
+
         except Exception as e:
-            logger.error(f"매핑 저장 실패: {e}")
+            logger.error(f"매핑 저장 실패 (#{source_msg_id} → #{target_msg_id}): {e}")
+            # DB 저장 실패 시 메모리에도 저장하지 않음 (일관성 유지)
 
     async def _get_mapping(self, source_msg_id: int) -> int:
         """메시지 ID 매핑 조회 (메모리 캐시 우선, 없으면 DB)"""
@@ -959,11 +986,7 @@ class WorkerBot:
         source_chat_id = str(self.source.id) if hasattr(self.source, 'id') else str(self.source)
 
         try:
-            # 메모리에서 제거
-            if source_msg_id in self.message_map:
-                del self.message_map[source_msg_id]
-
-            # DB에서도 제거
+            # DB에서 먼저 삭제 (원자성 보장)
             async with aiosqlite.connect(DATABASE_PATH) as db:
                 await db.execute(
                     """
@@ -973,8 +996,14 @@ class WorkerBot:
                     (self.worker_id, source_chat_id, source_msg_id)
                 )
                 await db.commit()
+
+            # DB 삭제 성공 후에만 메모리에서 제거
+            if source_msg_id in self.message_map:
+                del self.message_map[source_msg_id]
+
         except Exception as e:
-            logger.error(f"매핑 삭제 실패: {e}")
+            logger.error(f"매핑 삭제 실패 (#{source_msg_id}): {e}")
+            # DB 삭제 실패 시 메모리도 건드리지 않음 (일관성 유지)
 
     # ========================================
     # Forum Topics 지원 메소드
