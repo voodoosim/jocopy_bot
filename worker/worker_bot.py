@@ -148,8 +148,13 @@ class WorkerBot:
                 )
 
                 # 소스 선택
-                resp = await conv.get_response(timeout=60)
-                source_input = resp.text.strip().lower()
+                try:
+                    resp = await conv.get_response(timeout=60)
+                    source_input = resp.text.strip().lower()
+                except asyncio.TimeoutError:
+                    await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
+                    self.source = None
+                    return
 
                 # 입력 파싱 (c1, g2 등)
                 if source_input.startswith('c'):
@@ -189,8 +194,14 @@ class WorkerBot:
                 )
 
                 # 타겟 선택
-                resp = await conv.get_response(timeout=60)
-                target_input = resp.text.strip().lower()
+                try:
+                    resp = await conv.get_response(timeout=60)
+                    target_input = resp.text.strip().lower()
+                except asyncio.TimeoutError:
+                    await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
+                    self.source = None
+                    self.target = None
+                    return
 
                 # 입력 파싱 (c1, g2 등)
                 if target_input.startswith('c'):
@@ -313,8 +324,13 @@ class WorkerBot:
                 await conv.send_message(text)
 
                 # 사용자 입력 대기
-                resp = await conv.get_response(timeout=60)
-                source_input = resp.text.strip().lower()
+                try:
+                    resp = await conv.get_response(timeout=60)
+                    source_input = resp.text.strip().lower()
+                except asyncio.TimeoutError:
+                    await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
+                    self.source = None
+                    return
 
                 # 입력 파싱 (c1, g2 등)
                 source_name = None
@@ -409,8 +425,13 @@ class WorkerBot:
                 await conv.send_message(text)
 
                 # 사용자 입력 대기
-                resp = await conv.get_response(timeout=60)
-                target_input = resp.text.strip().lower()
+                try:
+                    resp = await conv.get_response(timeout=60)
+                    target_input = resp.text.strip().lower()
+                except asyncio.TimeoutError:
+                    await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
+                    self.target = None
+                    return
 
                 # 입력 파싱 (c1, g2 등)
                 target_name = None
@@ -486,53 +507,63 @@ class WorkerBot:
             if not self.source or not self.target:
                 return await event.reply("❌ .설정 먼저 하세요")
 
-            # Bug #2 수정: 중복 실행 경고
+            # Bug #2 수정: 중복 실행 경고 + Race Condition 방지
             if self.mirroring_active:
                 return await event.reply(
                     "⚠️ 미러링이 이미 실행 중입니다\n\n"
                     "중복 복사를 원하면 먼저 `.중지` 후 다시 실행하세요"
                 )
 
-            await event.reply("🔄 미러링 시작...")
-            await self.log("미러링 시작", "START")
-
-            # 0. DB에서 기존 매핑 로드 (Bug #3 수정: 재시작 후에도 편집/삭제 동기화)
-            await self._load_mappings_from_db()
-
-            # Forum 확인 및 토픽 동기화
-            is_forum = await self._is_forum(self.source)
-            if is_forum:
-                await event.reply("📂 Forum 감지! 토픽 동기화 중...")
-                await self._sync_forum_topics()
-                # Bug #4 경고: Forum 토픽은 실시간 미러링에서 무시됨
-                await event.reply(
-                    "⚠️ 주의: Forum 토픽 구조는 초기 복사에만 적용됩니다\n"
-                    "실시간 미러링은 모든 메시지가 General 토픽으로 전송됩니다"
-                )
-
-            # 1. 전체 복사 (초기 동기화)
-            count = await self._copy_all()
-
-            # 2. 실시간 미러링 활성화 (영구 핸들러 작동 시작)
+            # Race Condition 방지: 플래그를 먼저 설정
             self.mirroring_active = True
 
-            if is_forum:
-                await event.reply(
-                    f"✅ 초기 복사: {count}개\n"
-                    f"📂 Forum 토픽: {len(self.topic_mapping)}개\n"
-                    f"📝 기존 매핑: {len(self.message_map)}개\n"
-                    f"🔄 실시간 동기화 활성\n\n"
-                    f"💡 `.중지` 명령으로 미러링 중지 가능"
-                )
-            else:
-                await event.reply(
-                    f"✅ 초기 복사: {count}개\n"
-                    f"📝 기존 매핑: {len(self.message_map)}개\n"
-                    f"🔄 실시간 동기화 활성\n\n"
-                    f"💡 `.중지` 명령으로 미러링 중지 가능"
-                )
+            try:
+                await event.reply("🔄 미러링 시작...")
+                await self.log("미러링 시작", "START")
 
-            await self.log(f"초기 복사 완료: {count}개, 실시간 동기화 활성화", "SUCCESS")
+                # 0. DB에서 기존 매핑 로드 (Bug #3 수정: 재시작 후에도 편집/삭제 동기화)
+                await self._load_mappings_from_db()
+
+                # Forum 확인 및 토픽 동기화
+                is_forum = await self._is_forum(self.source)
+                if is_forum:
+                    await event.reply("📂 Forum 감지! 토픽 동기화 중...")
+                    await self._sync_forum_topics()
+                    # Bug #4 경고: Forum 토픽은 실시간 미러링에서 무시됨
+                    await event.reply(
+                        "⚠️ 주의: Forum 토픽 구조는 초기 복사에만 적용됩니다\n"
+                        "실시간 미러링은 모든 메시지가 General 토픽으로 전송됩니다"
+                    )
+
+                # 1. 전체 복사 (초기 동기화)
+                count = await self._copy_all()
+
+                # 2. 실시간 미러링은 이미 활성화됨 (상단에서 플래그 설정)
+
+                if is_forum:
+                    await event.reply(
+                        f"✅ 초기 복사: {count}개\n"
+                        f"📂 Forum 토픽: {len(self.topic_mapping)}개\n"
+                        f"📝 기존 매핑: {len(self.message_map)}개\n"
+                        f"🔄 실시간 동기화 활성\n\n"
+                        f"💡 `.중지` 명령으로 미러링 중지 가능"
+                    )
+                else:
+                    await event.reply(
+                        f"✅ 초기 복사: {count}개\n"
+                        f"📝 기존 매핑: {len(self.message_map)}개\n"
+                        f"🔄 실시간 동기화 활성\n\n"
+                        f"💡 `.중지` 명령으로 미러링 중지 가능"
+                    )
+
+                await self.log(f"초기 복사 완료: {count}개, 실시간 동기화 활성화", "SUCCESS")
+
+            except Exception as e:
+                # 에러 발생 시 플래그 해제
+                self.mirroring_active = False
+                await event.reply(f"❌ 미러링 시작 실패: {str(e)}")
+                await self.log(f"미러링 시작 실패: {e}", "ERROR")
+                raise
 
         @self.client.on(events.NewMessage(pattern=r'^\.중지$', from_users="me"))
         async def stop_mirror(event):
@@ -603,9 +634,11 @@ class WorkerBot:
                 )
 
                 # 2. 새 그룹 생성
-                # 제목 길이 제한 (Telegram 최대 255자)
-                if len(source_title) > 255:
-                    source_title = source_title[:252] + "..."
+                # 제목 길이 제한 (UTF-8 안전하게 절단)
+                if len(source_title.encode('utf-8')) > 255:
+                    # UTF-8 바이트 레벨로 절단
+                    truncated = source_title.encode('utf-8')[:252]
+                    source_title = truncated.decode('utf-8', errors='ignore') + "..."
 
                 # 슈퍼그룹 생성 (메가그룹)
                 result = await self.client(CreateChannelRequest(
@@ -623,10 +656,10 @@ class WorkerBot:
 
                 await event.reply(f"✅ 그룹 생성 완료: **{source_title}**")
 
-                # 3. 프로필 사진 복사 (선택적)
+                # 3. 프로필 사진 복사 (선택적) + BytesIO 리소스 관리
+                photo_bytes = BytesIO()
                 try:
                     # 소스 프로필 사진 다운로드
-                    photo_bytes = BytesIO()
                     photo = await self.client.download_profile_photo(self.source, file=photo_bytes)
                     if photo:
                         # 새 그룹에 업로드
@@ -641,6 +674,9 @@ class WorkerBot:
                 except Exception as e:
                     logger.warning(f"프로필 사진 복사 실패: {e}")
                     await event.reply("⚠️ 프로필 사진 복사 실패 (선택적 기능)")
+                finally:
+                    # 항상 BytesIO 리소스 해제
+                    photo_bytes.close()
 
                 # 4. 자동으로 target 설정
                 self.target = new_group
@@ -1086,8 +1122,12 @@ class WorkerBot:
                 icon_color=icon_color or 0x6FB9F0,  # 기본 파란색
                 icon_emoji_id=icon_emoji_id or 0
             ))
-            # 생성된 토픽 ID 반환
-            return result.updates[0].message.id if result.updates else None
+            # 생성된 토픽 ID 반환 (reply_to_top_id 사용)
+            if result.updates and result.updates[0].message:
+                msg = result.updates[0].message
+                if hasattr(msg, 'reply_to') and msg.reply_to:
+                    return getattr(msg.reply_to, 'reply_to_top_id', None)
+            return None
         except Exception as e:
             logger.error(f"토픽 생성 실패 ({title}): {e}")
             return None
@@ -1224,7 +1264,12 @@ class WorkerBot:
             if progress_msg:
                 new_count = current_count + len(batch)
                 if new_count % 50 == 0 or new_count < 50:
-                    await progress_msg.edit(f"📤 복사 중... {new_count}개 (배치 처리)")
+                    try:
+                        await progress_msg.edit(f"📤 복사 중... {new_count}개 (배치 처리)")
+                    except Exception as edit_ex:
+                        logger.warning(f"진행률 업데이트 실패 (무시): {edit_ex}")
+                        # progress_msg를 None으로 설정할 수 없음 (함수 파라미터)
+                        pass
 
             return len(batch)
 
@@ -1300,20 +1345,31 @@ class WorkerBot:
 
         async for msg in self.client.iter_messages(self.source, min_id=min_id, reverse=True):
             try:
-                # 메시지가 토픽에 속한 경우 처리
-                topic_id = getattr(msg, 'message_thread_id', None) or getattr(msg, 'reply_to', None)
-                target_topic_id = None
+                # 메시지가 토픽에 속한 경우 처리 (올바른 topic_id 추출)
+                topic_id = None
+                if hasattr(msg, 'reply_to') and msg.reply_to:
+                    topic_id = getattr(msg.reply_to, 'reply_to_top_id', None)
 
+                target_topic_id = None
                 if topic_id and self.topic_mapping:
                     target_topic_id = self.topic_mapping.get(topic_id)
 
-                # 전송
-                result = await self.client.forward_messages(
-                    self.target,
-                    msg.id,
-                    self.source,
-                    drop_author=True
-                )
+                # 전송 (Forum 토픽에 전송 시 reply_to 파라미터 사용)
+                if target_topic_id:
+                    result = await self.client.forward_messages(
+                        self.target,
+                        msg.id,
+                        self.source,
+                        drop_author=True,
+                        reply_to=target_topic_id  # Forum 토픽으로 전송
+                    )
+                else:
+                    result = await self.client.forward_messages(
+                        self.target,
+                        msg.id,
+                        self.source,
+                        drop_author=True
+                    )
 
                 # 메시지 ID 매핑 저장 - DB에 영구 저장
                 if result:
@@ -1335,15 +1391,25 @@ class WorkerBot:
 
                 # 진행률 표시
                 if progress_msg and count % 50 == 0:
-                    await progress_msg.edit(f"📤 복사 중... {count}개 (Forum)")
+                    try:
+                        await progress_msg.edit(f"📤 복사 중... {count}개 (Forum)")
+                    except Exception as edit_ex:
+                        logger.warning(f"진행률 업데이트 실패 (무시): {edit_ex}")
+                        progress_msg = None  # 더 이상 업데이트 시도 안함
 
             except FloodWaitError as e:
                 logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
                 await asyncio.sleep(e.seconds)
                 try:
-                    result = await self.client.forward_messages(
-                        self.target, msg.id, self.source, drop_author=True
-                    )
+                    # FloodWait 재시도 시에도 target_topic_id 사용
+                    if target_topic_id:
+                        result = await self.client.forward_messages(
+                            self.target, msg.id, self.source, drop_author=True, reply_to=target_topic_id
+                        )
+                    else:
+                        result = await self.client.forward_messages(
+                            self.target, msg.id, self.source, drop_author=True
+                        )
                     if result:
                         if hasattr(result, 'id'):
                             target_id = result.id
@@ -1371,17 +1437,39 @@ class WorkerBot:
         return count
 
     async def start(self):
-        """워커 시작"""
-        await self.client.start()
-        me = await self.client.get_me()
-        logger.info(f"✅ Worker '{self.worker_name}' 로그인: @{me.username}")
+        """워커 시작 (예외 처리 및 Cleanup 추가)"""
+        try:
+            await self.client.start()
+            me = await self.client.get_me()
+            logger.info(f"✅ Worker '{self.worker_name}' 로그인: @{me.username}")
 
-        # DB 상태 업데이트: starting → running
-        async with aiosqlite.connect(DATABASE_PATH) as db:
-            await db.execute(
-                "UPDATE workers SET status = 'running' WHERE id = ?",
-                (self.worker_id,)
-            )
-            await db.commit()
+            # DB 상태 업데이트: starting → running
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute(
+                    "UPDATE workers SET status = 'running' WHERE id = ?",
+                    (self.worker_id,)
+                )
+                await db.commit()
 
-        await self.client.run_until_disconnected()
+            await self.client.run_until_disconnected()
+
+        except Exception as e:
+            logger.error(f"❌ Worker 실행 실패: {e}", exc_info=True)
+            await self.log(f"Worker 실행 실패: {e}", "ERROR")
+        finally:
+            # Cleanup: 항상 DB 상태 업데이트 및 연결 종료
+            try:
+                async with aiosqlite.connect(DATABASE_PATH) as db:
+                    await db.execute(
+                        "UPDATE workers SET status = 'stopped', process_id = NULL WHERE id = ?",
+                        (self.worker_id,)
+                    )
+                    await db.commit()
+                logger.info(f"✅ Worker '{self.worker_name}' 정리 완료")
+            except Exception as cleanup_ex:
+                logger.error(f"❌ Cleanup 실패: {cleanup_ex}")
+
+            try:
+                await self.client.disconnect()
+            except:
+                pass
