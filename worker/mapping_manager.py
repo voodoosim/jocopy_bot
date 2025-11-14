@@ -5,18 +5,71 @@ It implements a DB-first pattern with memory caching for performance.
 
 Key Features:
 - DB-first pattern: All writes go to DB before memory
-- Memory cache: Fast lookups without DB queries
+- Memory cache: Fast lookups without DB queries (LRU with max size)
 - Atomic operations: DB and memory stay in sync
 - Crash-safe: Mappings persist across worker restarts
+- Memory-safe: LRU eviction prevents unbounded growth
 """
 
 import logging
 import aiosqlite
 from typing import Dict, Optional, Any
+from collections import OrderedDict
 
 from config import DATABASE_PATH
 
 logger = logging.getLogger(__name__)
+
+
+class LRUCache(OrderedDict):
+    """LRU (Least Recently Used) Cache with maximum size limit.
+
+    Automatically evicts oldest items when size exceeds max_size.
+    This prevents memory bloat during long-running operations.
+
+    Attributes:
+        max_size (int): Maximum number of items to cache
+
+    Example:
+        >>> cache = LRUCache(max_size=10000)
+        >>> cache[123] = 456
+        >>> value = cache[123]  # Moves to end (most recently used)
+        >>> if len(cache) > max_size: cache.popitem(last=False)  # Auto-evict
+    """
+
+    def __init__(self, max_size: int = 10000):
+        """Initialize LRU cache.
+
+        Args:
+            max_size: Maximum number of items (default: 10,000 mappings)
+                     With 10K mappings, memory usage ≈ 160KB (very efficient)
+        """
+        self.max_size = max_size
+        super().__init__()
+        logger.info(f"📦 [Optimization Phase 2] LRU Cache initialized (max_size={max_size:,})")
+
+    def __setitem__(self, key, value):
+        """Set item with LRU policy.
+
+        If key exists, move it to end (most recently used).
+        If size exceeds max_size, evict oldest item (FIFO).
+        """
+        if key in self:
+            # Key exists, move to end (mark as recently used)
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+
+        # Evict oldest if size exceeded
+        if len(self) > self.max_size:
+            oldest_key = next(iter(self))
+            evicted = self.pop(oldest_key)
+            logger.debug(f"🗑️ LRU Cache evicted: {oldest_key} → {evicted} (size: {len(self):,})")
+
+    def __getitem__(self, key):
+        """Get item and mark as recently used."""
+        value = super().__getitem__(key)
+        self.move_to_end(key)  # Mark as recently used
+        return value
 
 
 class MessageMappingManager:
@@ -38,16 +91,19 @@ class MessageMappingManager:
         message_map (Dict[int, int]): Source msg ID → Target msg ID cache
     """
 
-    def __init__(self, worker_id: int, worker_name: str):
+    def __init__(self, worker_id: int, worker_name: str, max_cache_size: int = 10000):
         """Initialize the mapping manager
 
         Args:
             worker_id: Unique worker identifier (from DB)
             worker_name: Human-readable worker name (for logging)
+            max_cache_size: Maximum cached mappings (default: 10,000)
+                           Prevents unbounded memory growth
         """
         self.worker_id = worker_id
         self.worker_name = worker_name
-        self.message_map: Dict[int, int] = {}  # source_msg_id → target_msg_id
+        self.message_map: LRUCache = LRUCache(max_size=max_cache_size)  # LRU cache
+        logger.info(f"✅ [Optimization Phase 2] MessageMappingManager initialized with LRU cache")
 
     async def save_mapping(
         self,
@@ -336,8 +392,9 @@ class MessageMappingManager:
             - Only clears memory cache
             - Can be repopulated via load_mappings_from_db()
         """
+        cache_size_before = len(self.message_map)
         self.message_map.clear()
-        logger.info("메모리 캐시 초기화됨")
+        logger.info(f"🗑️ 메모리 캐시 초기화됨 (cleared {cache_size_before:,} mappings)")
 
     def get_cache_size(self) -> int:
         """메모리 캐시 크기 조회
@@ -351,3 +408,32 @@ class MessageMappingManager:
             - Statistics: Report mapping count
         """
         return len(self.message_map)
+
+    def get_cache_stats(self) -> dict:
+        """LRU 캐시 통계 조회 (Optimization Phase 2)
+
+        Returns:
+            dict: Cache statistics
+                - current_size: Current number of cached items
+                - max_size: Maximum cache capacity
+                - usage_percent: Cache usage percentage
+                - memory_estimate_kb: Estimated memory usage in KB
+
+        Example:
+            >>> stats = manager.get_cache_stats()
+            >>> print(f"Cache: {stats['current_size']:,}/{stats['max_size']:,} "
+            ...       f"({stats['usage_percent']:.1f}%)")
+        """
+        current_size = len(self.message_map)
+        max_size = self.message_map.max_size
+        usage_percent = (current_size / max_size * 100) if max_size > 0 else 0
+
+        # Estimate memory: Each mapping ≈ 16 bytes (int → int)
+        memory_estimate_kb = (current_size * 16) / 1024
+
+        return {
+            "current_size": current_size,
+            "max_size": max_size,
+            "usage_percent": usage_percent,
+            "memory_estimate_kb": memory_estimate_kb
+        }
