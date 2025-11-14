@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import aiosqlite
+from typing import Dict
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
@@ -34,6 +35,13 @@ class WorkerBot:
         # 소스/타겟
         self.source = None
         self.target = None
+
+        # 미러링 활성화 플래그 (중복 등록 방지용)
+        self.mirroring_active = False
+
+        # 메시지 ID 매핑 (소스 메시지 ID → 타겟 메시지 ID)
+        # 편집/삭제 동기화에 필요
+        self.message_map: Dict[int, int] = {}
 
         # Forum 토픽 매핑 (소스 토픽 ID → 타겟 토픽 ID)
         self.topic_mapping = {}
@@ -463,7 +471,11 @@ class WorkerBot:
 
         @self.client.on(events.NewMessage(pattern=r'^\.미러$', from_users="me"))
         async def mirror(event):
-            """미러링: forward_messages 방식 (MCP 최적화) + Forum Topics 지원"""
+            """
+            미러링 시작 (MCP 최적화)
+            - 영구 핸들러 사용 (중복 등록 없음!)
+            - 초기 복사 + 플래그 활성화만 수행
+            """
             if not self.source or not self.target:
                 return await event.reply("❌ .설정 먼저 하세요")
 
@@ -476,83 +488,37 @@ class WorkerBot:
                 await event.reply("📂 Forum 감지! 토픽 동기화 중...")
                 await self._sync_forum_topics()
 
-            # 1. 전체 복사 (forward_messages)
+            # 1. 전체 복사 (초기 동기화)
             count = await self._copy_all()
+
+            # 2. 실시간 미러링 활성화 (영구 핸들러 작동 시작)
+            self.mirroring_active = True
 
             if is_forum:
                 await event.reply(
                     f"✅ 초기 복사: {count}개\n"
                     f"📂 Forum 토픽: {len(self.topic_mapping)}개\n"
-                    f"🔄 실시간 동기화 활성"
+                    f"🔄 실시간 동기화 활성\n\n"
+                    f"💡 `.중지` 명령으로 미러링 중지 가능"
                 )
             else:
-                await event.reply(f"✅ 초기 복사: {count}개\n🔄 실시간 동기화 활성")
+                await event.reply(
+                    f"✅ 초기 복사: {count}개\n"
+                    f"🔄 실시간 동기화 활성\n\n"
+                    f"💡 `.중지` 명령으로 미러링 중지 가능"
+                )
 
             await self.log(f"초기 복사 완료: {count}개, 실시간 동기화 활성화", "SUCCESS")
 
-            # 2. 실시간 리스너 (단일 메시지) - Forum Topics 지원
-            @self.client.on(events.NewMessage(chats=self.source))
-            async def on_new(e):
-                # Album 메시지는 건너뛰기 (Album 이벤트에서 처리)
-                if e.message.grouped_id:
-                    return
-
-                try:
-                    # 토픽 ID 확인
-                    topic_id = getattr(e.message, 'message_thread_id', None)
-                    target_topic_id = self.topic_mapping.get(topic_id) if topic_id else None
-
-                    if target_topic_id:
-                        # Forum 토픽으로 전송
-                        # Note: forward_messages는 reply_to 지원 안함
-                        # send_message 사용 필요 (파일 포함 시)
-                        logger.info(f"토픽 메시지 실시간 복사: #{e.message.id} → 토픽 #{target_topic_id}")
-                        # 임시로 forward_messages 사용 (개선 여지 있음)
-                        await self.client.forward_messages(
-                            self.target,
-                            e.message.id,
-                            self.source,
-                            drop_author=True
-                        )
-                    else:
-                        # 일반 메시지 또는 토픽 매핑 없음
-                        await self.client.forward_messages(
-                            self.target,
-                            e.message.id,
-                            self.source,
-                            drop_author=True  # "Forwarded from..." 제거
-                        )
-                except FloodWaitError as e:
-                    logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
-                    await asyncio.sleep(e.seconds)
-                    await self.client.forward_messages(
-                        self.target, e.message.id, self.source, drop_author=True
-                    )
-                except MessageIdInvalidError:
-                    logger.warning(f"⚠️ 메시지 #{e.message.id} 건너뜀")
-                except ChatWriteForbiddenError:
-                    logger.error("❌ 타겟 채널 쓰기 권한 없음!")
-                except ChannelPrivateError:
-                    logger.error("❌ 소스 채널 접근 권한 없음!")
-
-            # 3. Album (미디어 그룹) 리스너
-            @self.client.on(events.Album(chats=self.source))
-            async def on_album(e):
-                # 미디어 그룹 전체 전송
-                # TODO: Forum Topics 지원 추가 (reply_to)
-                await self.client.send_message(
-                    self.target,
-                    file=e.messages,
-                    message=[m.message for m in e.messages]
-                )
-
-            @self.client.on(events.MessageDeleted(chats=self.source))
-            async def on_del(e):
-                await self.client.delete_messages(self.target, e.deleted_ids)
-
-            @self.client.on(events.MessageEdited(chats=self.source))
-            async def on_edit(e):
-                await self.client.edit_message(self.target, e.message.id, e.message.text)
+        @self.client.on(events.NewMessage(pattern=r'^\.중지$', from_users="me"))
+        async def stop_mirror(event):
+            """미러링 중지"""
+            if self.mirroring_active:
+                self.mirroring_active = False
+                await event.reply("🛑 미러링 중지됨")
+                await self.log("미러링 중지", "STOP")
+            else:
+                await event.reply("ℹ️ 미러링이 실행 중이지 않습니다")
 
         @self.client.on(events.NewMessage(pattern=r'^\.카피$', from_users="me"))
         async def copy(event):
@@ -582,6 +548,164 @@ class WorkerBot:
 
             await msg.edit(f"✅ 복사 완료: {count}개")
             await self.log(f"범위 복사 완료: {count}개", "SUCCESS")
+
+        # ========================================
+        # 영구 이벤트 핸들러 (한 번만 등록)
+        # mirroring_active 플래그로 활성화 제어
+        # ========================================
+
+        @self.client.on(events.NewMessage())
+        async def on_new_permanent(e):
+            """영구 NewMessage 핸들러 (중복 등록 방지)"""
+            # 미러링 비활성 또는 소스 불일치 시 무시
+            if not self.mirroring_active:
+                return
+            if not self.source or e.chat_id != self.source.id:
+                return
+            # Album 메시지는 on_album에서 처리
+            if e.message.grouped_id:
+                return
+
+            try:
+                # 토픽 ID 확인 (Forum)
+                topic_id = getattr(e.message, 'message_thread_id', None)
+                target_topic_id = self.topic_mapping.get(topic_id) if topic_id else None
+
+                if target_topic_id:
+                    logger.info(f"토픽 메시지 복사: #{e.message.id} → 토픽 #{target_topic_id}")
+
+                # MCP 방식으로 전송
+                result = await self.client.forward_messages(
+                    self.target,
+                    e.message.id,
+                    self.source,
+                    drop_author=True
+                )
+
+                # 메시지 ID 매핑 저장 (편집/삭제 동기화용)
+                if result:
+                    target_id = result.id if hasattr(result, 'id') else result[0].id
+                    self.message_map[e.message.id] = target_id
+                    logger.debug(f"📝 매핑 저장: {e.message.id} → {target_id}")
+
+            except FloodWaitError as fw:
+                logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
+                await asyncio.sleep(fw.seconds)
+                result = await self.client.forward_messages(
+                    self.target, e.message.id, self.source, drop_author=True
+                )
+                # FloodWait 재시도 후에도 매핑 저장
+                if result:
+                    target_id = result.id if hasattr(result, 'id') else result[0].id
+                    self.message_map[e.message.id] = target_id
+            except MessageIdInvalidError:
+                logger.warning(f"⚠️ 메시지 #{e.message.id} 건너뜀")
+            except ChatWriteForbiddenError:
+                logger.error("❌ 타겟 채널 쓰기 권한 없음!")
+            except ChannelPrivateError:
+                logger.error("❌ 소스 채널 접근 권한 없음!")
+
+        @self.client.on(events.Album())
+        async def on_album_permanent(e):
+            """영구 Album 핸들러 (중복 등록 방지)"""
+            if not self.mirroring_active:
+                return
+            if not self.source or e.chat_id != self.source.id:
+                return
+
+            try:
+                # MCP 방식으로 Album 전송
+                source_ids = [m.id for m in e.messages]
+                result = await self.client.forward_messages(
+                    self.target,
+                    source_ids,
+                    self.source,
+                    drop_author=True
+                )
+
+                # 메시지 ID 매핑 저장 (Album의 각 메시지)
+                if result:
+                    # result는 Message 리스트
+                    target_messages = result if isinstance(result, list) else [result]
+                    for source_msg, target_msg in zip(e.messages, target_messages):
+                        self.message_map[source_msg.id] = target_msg.id
+                        logger.debug(f"📝 Album 매핑: {source_msg.id} → {target_msg.id}")
+
+                logger.info(f"✅ Album 전송 완료: {len(e.messages)}개")
+
+            except FloodWaitError as fw:
+                logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
+                await asyncio.sleep(fw.seconds)
+                source_ids = [m.id for m in e.messages]
+                result = await self.client.forward_messages(
+                    self.target, source_ids, self.source, drop_author=True
+                )
+                # FloodWait 재시도 후에도 매핑 저장
+                if result:
+                    target_messages = result if isinstance(result, list) else [result]
+                    for source_msg, target_msg in zip(e.messages, target_messages):
+                        self.message_map[source_msg.id] = target_msg.id
+
+            except Exception as ex:
+                logger.error(f"❌ Album 전송 실패: {ex}")
+
+        @self.client.on(events.MessageDeleted())
+        async def on_deleted_permanent(e):
+            """영구 MessageDeleted 핸들러 (중복 등록 방지)"""
+            if not self.mirroring_active:
+                return
+            if not self.source or e.chat_id != self.source.id:
+                return
+
+            # 소스 ID → 타겟 ID 변환
+            target_ids = []
+            for source_id in e.deleted_ids:
+                if source_id in self.message_map:
+                    target_ids.append(self.message_map[source_id])
+                    # 삭제된 메시지의 매핑 제거
+                    del self.message_map[source_id]
+                    logger.debug(f"🗑️ 삭제 매핑: {source_id} → {self.message_map.get(source_id, 'N/A')}")
+
+            # 타겟 메시지 삭제
+            if target_ids:
+                try:
+                    await self.client.delete_messages(self.target, target_ids)
+                    logger.info(f"🗑️ 메시지 삭제 완료: {len(target_ids)}개")
+                except Exception as ex:
+                    logger.warning(f"⚠️ 삭제 동기화 실패: {ex}")
+            else:
+                logger.debug(f"⚠️ 삭제할 메시지 매핑 없음: {e.deleted_ids}")
+
+        @self.client.on(events.MessageEdited())
+        async def on_edited_permanent(e):
+            """영구 MessageEdited 핸들러 (중복 등록 방지)"""
+            if not self.mirroring_active:
+                return
+            if not self.source or e.chat_id != self.source.id:
+                return
+
+            # 소스 ID → 타겟 ID 변환
+            source_id = e.message.id
+            if source_id not in self.message_map:
+                logger.debug(f"⚠️ 편집할 메시지 매핑 없음: {source_id}")
+                return
+
+            target_id = self.message_map[source_id]
+
+            # 텍스트 메시지 편집
+            if e.message.text:
+                try:
+                    await self.client.edit_message(
+                        self.target,
+                        target_id,
+                        e.message.text
+                    )
+                    logger.info(f"✏️ 메시지 편집 완료: {source_id} → {target_id}")
+                except Exception as ex:
+                    logger.warning(f"⚠️ 편집 동기화 실패: {ex}")
+            else:
+                # 미디어 메시지 편집은 Telegram API 제한으로 지원 안됨
+                logger.debug(f"⚠️ 미디어 메시지 편집 불가: {source_id}")
 
     async def log(self, message: str, level: str = "INFO"):
         """로그를 DB에 저장 (Main Bot이 나중에 전송)"""
@@ -722,7 +846,7 @@ class WorkerBot:
                 # forward_messages: 완전한 file_id 참조, 재업로드 없음
                 if target_topic_id:
                     # Forum 토픽으로 전송 (reply_to로 토픽 지정)
-                    await self.client.forward_messages(
+                    result = await self.client.forward_messages(
                         self.target,
                         msg.id,
                         self.source,
@@ -737,20 +861,30 @@ class WorkerBot:
                     logger.info(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
                 else:
                     # 일반 메시지 또는 토픽 매핑 없음
-                    await self.client.forward_messages(
+                    result = await self.client.forward_messages(
                         self.target,
                         msg.id,
                         self.source,
                         drop_author=True  # "Forwarded from..." 제거
                     )
+
+                # 메시지 ID 매핑 저장
+                if result:
+                    target_id = result.id if hasattr(result, 'id') else result[0].id
+                    self.message_map[msg.id] = target_id
+
                 count += 1
             except FloodWaitError as e:
                 logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
                 await self.log(f"FloodWait 대기: {e.seconds}초", "WARNING")
                 await asyncio.sleep(e.seconds)
-                await self.client.forward_messages(
+                result = await self.client.forward_messages(
                     self.target, msg.id, self.source, drop_author=True
                 )
+                # FloodWait 재시도 후에도 매핑 저장
+                if result:
+                    target_id = result.id if hasattr(result, 'id') else result[0].id
+                    self.message_map[msg.id] = target_id
                 count += 1
             except MessageIdInvalidError:
                 logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀 (이미 삭제됨)")
