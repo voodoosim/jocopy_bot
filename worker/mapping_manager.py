@@ -140,6 +140,7 @@ class MessageMappingManager:
 
         # 2. DB에서 조회
         if not source:
+            logger.warning(f"⚠️ get_mapping: source is None for msg #{source_msg_id}")
             return None
 
         source_chat_id = str(source.id) if hasattr(source, 'id') else str(source)
@@ -254,6 +255,7 @@ class MessageMappingManager:
             - Memory only modified after DB success
         """
         if not source:
+            logger.warning(f"⚠️ delete_mapping: source is None for msg #{source_msg_id}")
             return
 
         source_chat_id = str(source.id) if hasattr(source, 'id') else str(source)

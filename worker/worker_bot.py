@@ -78,41 +78,133 @@ class WorkerBot:
         )
         self.event_handlers.register_handlers()
 
+    # ========== Helper Methods (헬퍼 메소드) ==========
+
+    async def _get_chats_list(self):
+        """채널과 그룹 목록 가져오기 (중복 제거용 헬퍼)
+
+        Returns:
+            tuple: (channels, groups)
+                - channels: [(entity, title), ...]
+                - groups: [(entity, title), ...]
+        """
+        channels = []
+        groups = []
+
+        async for d in self.client.iter_dialogs():
+            if isinstance(d.entity, Channel):
+                if d.entity.broadcast:
+                    channels.append((d.entity, d.title))
+                else:
+                    groups.append((d.entity, d.title))
+            elif isinstance(d.entity, Chat):
+                groups.append((d.entity, d.title))
+
+        return channels, groups
+
+    async def _parse_chat_input(self, user_input: str, channels: list, groups: list, conv):
+        """채팅 입력 파싱 (c1, g2 등) - 중복 제거용 헬퍼
+
+        Args:
+            user_input: 사용자 입력 (c1, g2 등)
+            channels: 채널 리스트 [(entity, title), ...]
+            groups: 그룹 리스트 [(entity, title), ...]
+            conv: Conversation 객체 (에러 메시지 전송용)
+
+        Returns:
+            tuple: (entity, name) or (None, None) if error
+        """
+        user_input = user_input.strip().lower()
+
+        if user_input.startswith('c'):
+            try:
+                num = int(user_input[1:])
+                if num < 1 or num > len(channels):
+                    await conv.send_message(
+                        f"❌ 잘못된 채널 번호! c1~c{len(channels)} 입력"
+                    )
+                    return None, None
+                return channels[num - 1]
+            except (ValueError, IndexError):
+                await conv.send_message("❌ 형식 오류! 예: c1, c2")
+                return None, None
+
+        elif user_input.startswith('g'):
+            try:
+                num = int(user_input[1:])
+                if num < 1 or num > len(groups):
+                    await conv.send_message(
+                        f"❌ 잘못된 그룹 번호! g1~g{len(groups)} 입력"
+                    )
+                    return None, None
+                return groups[num - 1]
+            except (ValueError, IndexError):
+                await conv.send_message("❌ 형식 오류! 예: g1, g2")
+                return None, None
+
+        else:
+            await conv.send_message("❌ c(채널) 또는 g(그룹)로 시작! 예: c1, g2")
+            return None, None
+
+    async def _check_target_permission(self, target, target_name: str, conv):
+        """타겟 채널 쓰기 권한 확인 - 중복 제거용 헬퍼
+
+        Args:
+            target: 타겟 entity
+            target_name: 타겟 이름
+            conv: Conversation 객체 (메시지 전송용)
+
+        Returns:
+            bool: 권한 있으면 True, 없으면 False
+        """
+        try:
+            test_msg = await self.client.send_message(
+                target, "🔧 권한 체크 중..."
+            )
+            await test_msg.delete()
+            return True
+        except ChatWriteForbiddenError:
+            await conv.send_message(
+                f"❌ 타겟 채널 쓰기 권한 없음!\n\n"
+                f"📥 타겟: {target_name}\n\n"
+                f"**해결 방법:**\n"
+                f"1. 타겟 채널에서 이 계정을 관리자로 추가\n"
+                f"2. '메시지 게시' 권한 활성화\n"
+                f"3. 다시 시도"
+            )
+            return False
+        except Exception as e:
+            await conv.send_message(f"❌ 권한 체크 실패: {str(e)}")
+            return False
+
+    # ========== Command Handlers (명령어 핸들러) ==========
+
     def _setup_handlers(self):
         """명령어 등록"""
 
         @self.client.on(events.NewMessage(pattern=r'^\.목록$', from_users="me"))
         async def list_chats(event):
             """채널 및 그룹 목록 (구분하여 표시)"""
-            channels = []
-            groups = []
+            channels, groups = await self._get_chats_list()
 
-            async for d in self.client.iter_dialogs():
-                if isinstance(d.entity, Channel):
-                    if d.entity.broadcast:
-                        # 방송 채널
-                        channels.append(d.title)
-                    else:
-                        # 슈퍼그룹
-                        groups.append(d.title)
-                elif isinstance(d.entity, Chat):
-                    # 일반 그룹
-                    groups.append(d.title)
+            # 이름만 추출
+            channel_names = [title for _, title in channels]
+            group_names = [title for _, title in groups]
 
             # 채널/그룹별로 정리해서 표시
             text = ""
-            if channels:
+            if channel_names:
                 text += "📢 **채널:**\n"
-                for i, title in enumerate(channels, 1):
+                for i, title in enumerate(channel_names, 1):
                     text += f"{i}. {title}\n"
             else:
                 text += "📢 **채널:** 없음\n"
 
             text += "\n"
 
-            if groups:
+            if group_names:
                 text += "👥 **그룹:**\n"
-                for i, title in enumerate(groups, 1):
+                for i, title in enumerate(group_names, 1):
                     text += f"{i}. {title}\n"
             else:
                 text += "👥 **그룹:** 없음"
@@ -121,23 +213,10 @@ class WorkerBot:
 
         @self.client.on(events.NewMessage(pattern=r'^\.설정$', from_users="me"))
         async def setup(event):
-            """소스/타겟 설정 (채널/그룹 구분)"""
-            # 채널과 그룹 분리
-            channels = []
-            groups = []
+            """소스/타겟 설정 (채널/그룹 구분) - 헬퍼 메소드 사용"""
+            channels, groups = await self._get_chats_list()
 
-            async for d in self.client.iter_dialogs():
-                if isinstance(d.entity, Channel):
-                    if d.entity.broadcast:
-                        channels.append((d.entity, d.title))
-                    else:
-                        groups.append((d.entity, d.title))
-                elif isinstance(d.entity, Chat):
-                    groups.append((d.entity, d.title))
-
-            all_chats = channels + groups
-
-            if not all_chats:
+            if not channels and not groups:
                 return await event.reply("❌ 채널/그룹 없음")
 
             # conversation API 사용 (Saved Messages - me.id 사용)
@@ -173,42 +252,19 @@ class WorkerBot:
                 # 소스 선택
                 try:
                     resp = await conv.get_response(timeout=60)
-                    source_input = resp.text.strip().lower()
                 except asyncio.TimeoutError:
                     await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
                     self.source = None
                     return
 
-                # 입력 파싱 (c1, g2 등)
-                if source_input.startswith('c'):
-                    try:
-                        num = int(source_input[1:])
-                        if num < 1 or num > len(channels):
-                            await conv.send_message(
-                                f"❌ 잘못된 채널 번호! c1~c{len(channels)} 입력"
-                            )
-                            return
-                        self.source = channels[num - 1][0]
-                        source_name = channels[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: c1, c2")
-                        return
-                elif source_input.startswith('g'):
-                    try:
-                        num = int(source_input[1:])
-                        if num < 1 or num > len(groups):
-                            await conv.send_message(
-                                f"❌ 잘못된 그룹 번호! g1~g{len(groups)} 입력"
-                            )
-                            return
-                        self.source = groups[num - 1][0]
-                        source_name = groups[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: g1, g2")
-                        return
-                else:
-                    await conv.send_message("❌ c(채널) 또는 g(그룹)로 시작! 예: c1, g2")
+                # 입력 파싱 (헬퍼 메소드 사용)
+                source_entity, source_name = await self._parse_chat_input(
+                    resp.text, channels, groups, conv
+                )
+                if not source_entity:
                     return
+
+                self.source = source_entity
 
                 await conv.send_message(
                     f"✅ 소스: {source_name}\n\n"
@@ -219,58 +275,24 @@ class WorkerBot:
                 # 타겟 선택
                 try:
                     resp = await conv.get_response(timeout=60)
-                    target_input = resp.text.strip().lower()
                 except asyncio.TimeoutError:
                     await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
                     self.source = None
                     self.target = None
                     return
 
-                # 입력 파싱 (c1, g2 등)
-                if target_input.startswith('c'):
-                    try:
-                        num = int(target_input[1:])
-                        if num < 1 or num > len(channels):
-                            await conv.send_message(
-                                f"❌ 잘못된 채널 번호! c1~c{len(channels)} 입력"
-                            )
-                            self.source = None
-                            return
-                        self.target = channels[num - 1][0]
-                        target_name = channels[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: c1, c2")
-                        self.source = None
-                        return
-                elif target_input.startswith('g'):
-                    try:
-                        num = int(target_input[1:])
-                        if num < 1 or num > len(groups):
-                            await conv.send_message(
-                                f"❌ 잘못된 그룹 번호! g1~g{len(groups)} 입력"
-                            )
-                            self.source = None
-                            return
-                        self.target = groups[num - 1][0]
-                        target_name = groups[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: g1, g2")
-                        self.source = None
-                        return
-                else:
-                    await conv.send_message("❌ c(채널) 또는 g(그룹)로 시작! 예: c1, g2")
+                # 입력 파싱 (헬퍼 메소드 사용)
+                target_entity, target_name = await self._parse_chat_input(
+                    resp.text, channels, groups, conv
+                )
+                if not target_entity:
                     self.source = None
                     return
 
-                # 타겟 권한 체크
-                try:
-                    # 테스트 메시지 전송 후 즉시 삭제
-                    test_msg = await self.client.send_message(
-                        self.target,
-                        "🔧 권한 체크 중..."
-                    )
-                    await test_msg.delete()
+                self.target = target_entity
 
+                # 타겟 권한 체크 (헬퍼 메소드 사용)
+                if await self._check_target_permission(self.target, target_name, conv):
                     await conv.send_message(
                         f"✅ **설정 완료!**\n\n"
                         f"📤 **소스:** {source_name}\n"
@@ -282,40 +304,13 @@ class WorkerBot:
                         f"• `.카피` - 전체 메시지 복사\n"
                         f"• `.설정` - 다시 설정"
                     )
-                except ChatWriteForbiddenError:
-                    await conv.send_message(
-                        f"❌ 타겟 채널 쓰기 권한 없음!\n\n"
-                        f"📥 타겟: {target_name}\n\n"
-                        f"**해결 방법:**\n"
-                        f"1. 타겟 채널에서 이 계정을 관리자로 추가\n"
-                        f"2. '메시지 게시' 권한 활성화\n"
-                        f"3. 다시 .설정 실행"
-                    )
-                    self.target = None
-                except Exception as e:
-                    await conv.send_message(f"❌ 권한 체크 실패: {str(e)}")
+                else:
                     self.target = None
 
         @self.client.on(events.NewMessage(pattern=r'^\.소스입력$', from_users="me"))
         async def set_source(event):
-            """소스 채널/그룹 설정 (독립 명령)"""
-            # 채팅 목록 가져오기
-            all_chats = []
-            channels = []
-            groups = []
-
-            async for dialog in self.client.iter_dialogs():
-                entity = dialog.entity
-                title = dialog.title or "이름 없음"
-
-                # 채널 구분
-                if isinstance(entity, Channel) and entity.broadcast:
-                    channels.append((entity, title))
-                # 그룹 구분
-                elif isinstance(entity, Chat) or (
-                    isinstance(entity, Channel) and not entity.broadcast
-                ):
-                    groups.append((entity, title))
+            """소스 채널/그룹 설정 (독립 명령) - 헬퍼 메소드 사용"""
+            channels, groups = await self._get_chats_list()
 
             # conversation API 사용
             me = await self.client.get_me()
@@ -349,43 +344,19 @@ class WorkerBot:
                 # 사용자 입력 대기
                 try:
                     resp = await conv.get_response(timeout=60)
-                    source_input = resp.text.strip().lower()
                 except asyncio.TimeoutError:
                     await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
                     self.source = None
                     return
 
-                # 입력 파싱 (c1, g2 등)
-                source_name = None
-                if source_input.startswith('c'):
-                    try:
-                        num = int(source_input[1:])
-                        if num < 1 or num > len(channels):
-                            await conv.send_message(
-                                f"❌ 잘못된 채널 번호! c1~c{len(channels)} 입력"
-                            )
-                            return
-                        self.source = channels[num - 1][0]
-                        source_name = channels[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: c1, c2")
-                        return
-                elif source_input.startswith('g'):
-                    try:
-                        num = int(source_input[1:])
-                        if num < 1 or num > len(groups):
-                            await conv.send_message(
-                                f"❌ 잘못된 그룹 번호! g1~g{len(groups)} 입력"
-                            )
-                            return
-                        self.source = groups[num - 1][0]
-                        source_name = groups[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: g1, g2")
-                        return
-                else:
-                    await conv.send_message("❌ c(채널) 또는 g(그룹)로 시작! 예: c1, g2")
+                # 입력 파싱 (헬퍼 메소드 사용)
+                source_entity, source_name = await self._parse_chat_input(
+                    resp.text, channels, groups, conv
+                )
+                if not source_entity:
                     return
+
+                self.source = source_entity
 
                 # 성공 메시지
                 await conv.send_message(
@@ -399,24 +370,8 @@ class WorkerBot:
 
         @self.client.on(events.NewMessage(pattern=r'^\.타겟입력$', from_users="me"))
         async def set_target(event):
-            """타겟 채널/그룹 설정 (독립 명령)"""
-            # 채팅 목록 가져오기
-            all_chats = []
-            channels = []
-            groups = []
-
-            async for dialog in self.client.iter_dialogs():
-                entity = dialog.entity
-                title = dialog.title or "이름 없음"
-
-                # 채널 구분
-                if isinstance(entity, Channel) and entity.broadcast:
-                    channels.append((entity, title))
-                # 그룹 구분
-                elif isinstance(entity, Chat) or (
-                    isinstance(entity, Channel) and not entity.broadcast
-                ):
-                    groups.append((entity, title))
+            """타겟 채널/그룹 설정 (독립 명령) - 헬퍼 메소드 사용"""
+            channels, groups = await self._get_chats_list()
 
             # conversation API 사용
             me = await self.client.get_me()
@@ -450,52 +405,22 @@ class WorkerBot:
                 # 사용자 입력 대기
                 try:
                     resp = await conv.get_response(timeout=60)
-                    target_input = resp.text.strip().lower()
                 except asyncio.TimeoutError:
                     await conv.send_message("⏰ 시간 초과 (60초). 다시 시도하세요.")
                     self.target = None
                     return
 
-                # 입력 파싱 (c1, g2 등)
-                target_name = None
-                if target_input.startswith('c'):
-                    try:
-                        num = int(target_input[1:])
-                        if num < 1 or num > len(channels):
-                            await conv.send_message(
-                                f"❌ 잘못된 채널 번호! c1~c{len(channels)} 입력"
-                            )
-                            return
-                        self.target = channels[num - 1][0]
-                        target_name = channels[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: c1, c2")
-                        return
-                elif target_input.startswith('g'):
-                    try:
-                        num = int(target_input[1:])
-                        if num < 1 or num > len(groups):
-                            await conv.send_message(
-                                f"❌ 잘못된 그룹 번호! g1~g{len(groups)} 입력"
-                            )
-                            return
-                        self.target = groups[num - 1][0]
-                        target_name = groups[num - 1][1]
-                    except (ValueError, IndexError):
-                        await conv.send_message("❌ 형식 오류! 예: g1, g2")
-                        return
-                else:
-                    await conv.send_message("❌ c(채널) 또는 g(그룹)로 시작! 예: c1, g2")
+                # 입력 파싱 (헬퍼 메소드 사용)
+                target_entity, target_name = await self._parse_chat_input(
+                    resp.text, channels, groups, conv
+                )
+                if not target_entity:
                     return
 
-                # 타겟 쓰기 권한 확인
-                try:
-                    test_msg = await self.client.send_message(
-                        self.target, "✅ 권한 체크 (자동 삭제)"
-                    )
-                    await asyncio.sleep(1)
-                    await test_msg.delete()
+                self.target = target_entity
 
+                # 타겟 쓰기 권한 확인 (헬퍼 메소드 사용)
+                if await self._check_target_permission(self.target, target_name, conv):
                     # 성공 메시지
                     await conv.send_message(
                         f"✅ **타겟 설정 완료!**\n\n"
@@ -506,18 +431,7 @@ class WorkerBot:
                         f"• `.미러` - 실시간 미러링 시작\n"
                         f"• `.카피` - 전체 메시지 복사"
                     )
-                except ChatWriteForbiddenError:
-                    await conv.send_message(
-                        f"❌ **타겟 쓰기 권한 없음!**\n\n"
-                        f"**타겟:** {target_name}\n\n"
-                        f"**해결 방법:**\n"
-                        f"1. 타겟 채널에서 이 계정을 관리자로 추가\n"
-                        f"2. '메시지 게시' 권한 활성화\n"
-                        f"3. 다시 `.타겟입력` 실행"
-                    )
-                    self.target = None
-                except Exception as e:
-                    await conv.send_message(f"❌ 권한 체크 실패: {str(e)}")
+                else:
                     self.target = None
 
         @self.client.on(events.NewMessage(pattern=r'^\.미러$', from_users="me"))
