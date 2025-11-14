@@ -91,6 +91,38 @@ async def init_db():
             )
         """)
 
+        # message_mappings 테이블 (메시지 ID 매핑 - 편집/삭제 동기화용)
+        # Bug #3 수정: 메모리 대신 DB에 영구 저장
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS message_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                worker_id INTEGER NOT NULL,
+                source_chat_id TEXT NOT NULL,
+                target_chat_id TEXT NOT NULL,
+                source_msg_id INTEGER NOT NULL,
+                target_msg_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (worker_id) REFERENCES workers(id),
+                UNIQUE(worker_id, source_chat_id, source_msg_id)
+            )
+        """)
+
+        # message_mappings 인덱스 (빠른 조회를 위해)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_message_mappings_lookup
+            ON message_mappings(worker_id, source_chat_id, source_msg_id)
+        """)
+
+        # mirrors 테이블에 last_synced_message_id 컬럼 추가 (중복 방지용)
+        # Bug #2 수정: 이미 복사된 메시지 추적
+        try:
+            await db.execute("""
+                ALTER TABLE mirrors ADD COLUMN last_synced_message_id INTEGER
+            """)
+        except:
+            # 컬럼이 이미 존재하면 무시
+            pass
+
         await db.commit()
 
 async def get_db():

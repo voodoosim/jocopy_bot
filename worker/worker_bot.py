@@ -474,19 +474,34 @@ class WorkerBot:
             """
             미러링 시작 (MCP 최적화)
             - 영구 핸들러 사용 (중복 등록 없음!)
-            - 초기 복사 + 플래그 활성화만 수행
+            - DB 매핑 로드 + 초기 복사 + 플래그 활성화
             """
             if not self.source or not self.target:
                 return await event.reply("❌ .설정 먼저 하세요")
 
+            # Bug #2 수정: 중복 실행 경고
+            if self.mirroring_active:
+                return await event.reply(
+                    "⚠️ 미러링이 이미 실행 중입니다\n\n"
+                    "중복 복사를 원하면 먼저 `.중지` 후 다시 실행하세요"
+                )
+
             await event.reply("🔄 미러링 시작...")
             await self.log("미러링 시작", "START")
+
+            # 0. DB에서 기존 매핑 로드 (Bug #3 수정: 재시작 후에도 편집/삭제 동기화)
+            await self._load_mappings_from_db()
 
             # Forum 확인 및 토픽 동기화
             is_forum = await self._is_forum(self.source)
             if is_forum:
                 await event.reply("📂 Forum 감지! 토픽 동기화 중...")
                 await self._sync_forum_topics()
+                # Bug #4 경고: Forum 토픽은 실시간 미러링에서 무시됨
+                await event.reply(
+                    "⚠️ 주의: Forum 토픽 구조는 초기 복사에만 적용됩니다\n"
+                    "실시간 미러링은 모든 메시지가 General 토픽으로 전송됩니다"
+                )
 
             # 1. 전체 복사 (초기 동기화)
             count = await self._copy_all()
@@ -498,12 +513,14 @@ class WorkerBot:
                 await event.reply(
                     f"✅ 초기 복사: {count}개\n"
                     f"📂 Forum 토픽: {len(self.topic_mapping)}개\n"
+                    f"📝 기존 매핑: {len(self.message_map)}개\n"
                     f"🔄 실시간 동기화 활성\n\n"
                     f"💡 `.중지` 명령으로 미러링 중지 가능"
                 )
             else:
                 await event.reply(
                     f"✅ 초기 복사: {count}개\n"
+                    f"📝 기존 매핑: {len(self.message_map)}개\n"
                     f"🔄 실시간 동기화 활성\n\n"
                     f"💡 `.중지` 명령으로 미러링 중지 가능"
                 )
@@ -582,10 +599,10 @@ class WorkerBot:
                     drop_author=True
                 )
 
-                # 메시지 ID 매핑 저장 (편집/삭제 동기화용)
+                # 메시지 ID 매핑 저장 (편집/삭제 동기화용) - DB에 영구 저장
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
-                    self.message_map[e.message.id] = target_id
+                    await self._save_mapping(e.message.id, target_id)
                     logger.debug(f"📝 매핑 저장: {e.message.id} → {target_id}")
 
             except FloodWaitError as fw:
@@ -597,7 +614,7 @@ class WorkerBot:
                 # FloodWait 재시도 후에도 매핑 저장
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
-                    self.message_map[e.message.id] = target_id
+                    await self._save_mapping(e.message.id, target_id)
             except MessageIdInvalidError:
                 logger.warning(f"⚠️ 메시지 #{e.message.id} 건너뜀")
             except ChatWriteForbiddenError:
@@ -623,12 +640,22 @@ class WorkerBot:
                     drop_author=True
                 )
 
-                # 메시지 ID 매핑 저장 (Album의 각 메시지)
+                # 메시지 ID 매핑 저장 (Album의 각 메시지) - DB에 영구 저장
+                # Bug #1 수정: zip 안전성 체크
                 if result:
-                    # result는 Message 리스트
                     target_messages = result if isinstance(result, list) else [result]
+
+                    # 크기 불일치 경고 (Bug #1)
+                    if len(e.messages) != len(target_messages):
+                        logger.warning(
+                            f"⚠️ Album 크기 불일치: 전송 {len(e.messages)}개, "
+                            f"수신 {len(target_messages)}개 (grouped_id={e.grouped_id})"
+                        )
+                        await self.log(f"Album 부분 전송: {len(target_messages)}/{len(e.messages)}", "WARNING")
+
+                    # zip으로 매핑 저장
                     for source_msg, target_msg in zip(e.messages, target_messages):
-                        self.message_map[source_msg.id] = target_msg.id
+                        await self._save_mapping(source_msg.id, target_msg.id)
                         logger.debug(f"📝 Album 매핑: {source_msg.id} → {target_msg.id}")
 
                 logger.info(f"✅ Album 전송 완료: {len(e.messages)}개")
@@ -644,10 +671,19 @@ class WorkerBot:
                 if result:
                     target_messages = result if isinstance(result, list) else [result]
                     for source_msg, target_msg in zip(e.messages, target_messages):
-                        self.message_map[source_msg.id] = target_msg.id
+                        await self._save_mapping(source_msg.id, target_msg.id)
 
+            except ChatWriteForbiddenError:
+                logger.error(f"❌ Album 전송 실패 (grouped_id={e.grouped_id}): 타겟 쓰기 권한 없음")
+                await self.log("Album 전송 실패: 권한 없음", "ERROR")
+            except ChannelPrivateError:
+                logger.error(f"❌ Album 전송 실패 (grouped_id={e.grouped_id}): 소스 채널 접근 불가")
+                await self.log("Album 전송 실패: 채널 접근 불가", "ERROR")
+            except MessageIdInvalidError:
+                logger.warning(f"⚠️ Album 건너뜀 (grouped_id={e.grouped_id}): 메시지 삭제됨")
             except Exception as ex:
-                logger.error(f"❌ Album 전송 실패: {ex}")
+                logger.error(f"❌ Album 전송 실패 (grouped_id={e.grouped_id}, {len(e.messages)}개): {ex}")
+                await self.log(f"Album 전송 실패: {ex}", "ERROR")
 
         @self.client.on(events.MessageDeleted())
         async def on_deleted_permanent(e):
@@ -657,14 +693,16 @@ class WorkerBot:
             if not self.source or e.chat_id != self.source.id:
                 return
 
-            # 소스 ID → 타겟 ID 변환
+            # 소스 ID → 타겟 ID 변환 (DB에서 조회)
             target_ids = []
             for source_id in e.deleted_ids:
-                if source_id in self.message_map:
-                    target_ids.append(self.message_map[source_id])
-                    # 삭제된 메시지의 매핑 제거
-                    del self.message_map[source_id]
-                    logger.debug(f"🗑️ 삭제 매핑: {source_id} → {self.message_map.get(source_id, 'N/A')}")
+                target_id = await self._get_mapping(source_id)
+                if target_id:
+                    target_ids.append(target_id)
+                    # Bug #5 수정: 삭제 전에 로그
+                    logger.debug(f"🗑️ 삭제 매핑: {source_id} → {target_id}")
+                    # DB와 메모리에서 매핑 제거
+                    await self._delete_mapping(source_id)
 
             # 타겟 메시지 삭제
             if target_ids:
@@ -684,13 +722,13 @@ class WorkerBot:
             if not self.source or e.chat_id != self.source.id:
                 return
 
-            # 소스 ID → 타겟 ID 변환
+            # 소스 ID → 타겟 ID 변환 (DB에서 조회)
             source_id = e.message.id
-            if source_id not in self.message_map:
+            target_id = await self._get_mapping(source_id)
+
+            if not target_id:
                 logger.debug(f"⚠️ 편집할 메시지 매핑 없음: {source_id}")
                 return
-
-            target_id = self.message_map[source_id]
 
             # 텍스트 메시지 편집
             if e.message.text:
@@ -721,6 +759,120 @@ class WorkerBot:
                 await db.commit()
         except Exception as e:
             logger.error(f"로그 저장 실패: {e}")
+
+    # ========================================
+    # Message ID Mapping (DB 영구 저장)
+    # Bug #3 수정: 메모리 대신 DB에 저장하여 재시작 후에도 유지
+    # ========================================
+
+    async def _save_mapping(self, source_msg_id: int, target_msg_id: int):
+        """메시지 ID 매핑을 DB에 저장"""
+        if not self.source or not self.target:
+            return
+
+        source_chat_id = str(self.source.id) if hasattr(self.source, 'id') else str(self.source)
+        target_chat_id = str(self.target.id) if hasattr(self.target, 'id') else str(self.target)
+
+        try:
+            # 먼저 메모리 캐시에 저장 (빠른 조회)
+            self.message_map[source_msg_id] = target_msg_id
+
+            # DB에 영구 저장
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO message_mappings
+                    (worker_id, source_chat_id, target_chat_id, source_msg_id, target_msg_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (self.worker_id, source_chat_id, target_chat_id, source_msg_id, target_msg_id)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"매핑 저장 실패: {e}")
+
+    async def _get_mapping(self, source_msg_id: int) -> int:
+        """메시지 ID 매핑 조회 (메모리 캐시 우선, 없으면 DB)"""
+        # 1. 메모리 캐시 확인
+        if source_msg_id in self.message_map:
+            return self.message_map[source_msg_id]
+
+        # 2. DB에서 조회
+        if not self.source:
+            return None
+
+        source_chat_id = str(self.source.id) if hasattr(self.source, 'id') else str(self.source)
+
+        try:
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT target_msg_id FROM message_mappings
+                    WHERE worker_id = ? AND source_chat_id = ? AND source_msg_id = ?
+                    """,
+                    (self.worker_id, source_chat_id, source_msg_id)
+                )
+                row = await cursor.fetchone()
+                if row:
+                    target_msg_id = row[0]
+                    # 캐시에 추가
+                    self.message_map[source_msg_id] = target_msg_id
+                    return target_msg_id
+        except Exception as e:
+            logger.error(f"매핑 조회 실패: {e}")
+
+        return None
+
+    async def _load_mappings_from_db(self):
+        """DB에서 기존 매핑을 메모리로 로드 (워커 시작 시)"""
+        if not self.source:
+            return
+
+        source_chat_id = str(self.source.id) if hasattr(self.source, 'id') else str(self.source)
+
+        try:
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT source_msg_id, target_msg_id FROM message_mappings
+                    WHERE worker_id = ? AND source_chat_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 10000
+                    """,
+                    (self.worker_id, source_chat_id)
+                )
+                rows = await cursor.fetchall()
+                for source_id, target_id in rows:
+                    self.message_map[source_id] = target_id
+
+                logger.info(f"📝 DB에서 {len(rows)}개 매핑 로드됨")
+        except Exception as e:
+            logger.error(f"매핑 로드 실패: {e}")
+
+    async def _delete_mapping(self, source_msg_id: int):
+        """메시지 삭제 시 매핑도 제거"""
+        if not self.source:
+            return
+
+        source_chat_id = str(self.source.id) if hasattr(self.source, 'id') else str(self.source)
+
+        try:
+            # 메모리에서 제거
+            if source_msg_id in self.message_map:
+                del self.message_map[source_msg_id]
+
+            # DB에서도 제거
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                await db.execute(
+                    """
+                    DELETE FROM message_mappings
+                    WHERE worker_id = ? AND source_chat_id = ? AND source_msg_id = ?
+                    """,
+                    (self.worker_id, source_chat_id, source_msg_id)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"매핑 삭제 실패: {e}")
 
     # ========================================
     # Forum Topics 지원 메소드
@@ -870,14 +1022,14 @@ class WorkerBot:
                 drop_author=True
             )
 
-            # 메시지 ID 매핑 저장
+            # 메시지 ID 매핑 저장 - DB에 영구 저장
             # results는 단일 Message or Message 리스트
             if isinstance(results, list):
                 for msg, result in zip(batch, results):
-                    self.message_map[msg.id] = result.id
+                    await self._save_mapping(msg.id, result.id)
             else:
                 # 단일 메시지인 경우
-                self.message_map[batch[0].id] = results.id
+                await self._save_mapping(batch[0].id, results.id)
 
             # 진행률 표시
             if progress_msg:
@@ -895,12 +1047,12 @@ class WorkerBot:
             results = await self.client.forward_messages(
                 self.target, batch_ids, self.source, drop_author=True
             )
-            # 매핑 저장
+            # 매핑 저장 - DB에 영구 저장
             if isinstance(results, list):
                 for msg, result in zip(batch, results):
-                    self.message_map[msg.id] = result.id
+                    await self._save_mapping(msg.id, result.id)
             else:
-                self.message_map[batch[0].id] = results.id
+                await self._save_mapping(batch[0].id, results.id)
             return len(batch)
 
         except Exception as e:
@@ -914,8 +1066,8 @@ class WorkerBot:
                     )
                     if result:
                         target_id = result.id if hasattr(result, 'id') else result[0].id
-                        self.message_map[msg.id] = target_id
-                    sent_count += 1
+                        await self._save_mapping(msg.id, target_id)
+                        sent_count += 1
                 except MessageIdInvalidError:
                     logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀")
                 except Exception as ex:
@@ -943,10 +1095,10 @@ class WorkerBot:
                     drop_author=True
                 )
 
-                # 메시지 ID 매핑 저장
+                # 메시지 ID 매핑 저장 - DB에 영구 저장
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
-                    self.message_map[msg.id] = target_id
+                    await self._save_mapping(msg.id, target_id)
 
                 if target_topic_id:
                     logger.debug(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
@@ -965,7 +1117,7 @@ class WorkerBot:
                 )
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
-                    self.message_map[msg.id] = target_id
+                    await self._save_mapping(msg.id, target_id)
                 count += 1
             except MessageIdInvalidError:
                 logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀")
