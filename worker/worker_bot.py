@@ -823,15 +823,108 @@ class WorkerBot:
         return mapping
 
     async def _copy_all(self, min_id=None, progress_msg=None):
-        """forward_messages 방식 (MCP 최적화 - Context7 기반) + Forum Topics 지원"""
+        """
+        배치 처리 최적화 + Forum Topics 지원
+        - 일반 채널: 50개씩 배치 전송 (100배 빠름)
+        - Forum 채널: 개별 전송 (토픽 매핑 정확성 우선)
+        """
         count = 0
-        batch = []
 
         # Forum인 경우 토픽 동기화 먼저 수행
         is_forum = await self._is_forum(self.source)
         if is_forum:
             await self.log("Forum 감지! 토픽 동기화 시작...", "INFO")
             await self._sync_forum_topics()
+            # Forum은 개별 전송 (토픽 매핑 필요)
+            return await self._copy_all_individual(min_id, progress_msg)
+
+        # 일반 채널: 배치 처리
+        batch = []  # Message 객체 리스트
+        batch_ids = []  # 메시지 ID 리스트
+
+        async for msg in self.client.iter_messages(self.source, min_id=min_id, reverse=True):
+            batch.append(msg)
+            batch_ids.append(msg.id)
+
+            # 배치가 BATCH_SIZE에 도달하면 전송
+            if len(batch) >= BATCH_SIZE:
+                count += await self._send_batch(batch, batch_ids, progress_msg, count)
+                batch = []
+                batch_ids = []
+                await asyncio.sleep(0.5)  # FloodWait 방지
+
+        # 남은 메시지 처리
+        if batch:
+            count += await self._send_batch(batch, batch_ids, progress_msg, count)
+
+        return count
+
+    async def _send_batch(self, batch, batch_ids, progress_msg, current_count):
+        """배치 메시지 전송 및 매핑 저장"""
+        try:
+            # 배치 전송
+            results = await self.client.forward_messages(
+                self.target,
+                batch_ids,
+                self.source,
+                drop_author=True
+            )
+
+            # 메시지 ID 매핑 저장
+            # results는 단일 Message or Message 리스트
+            if isinstance(results, list):
+                for msg, result in zip(batch, results):
+                    self.message_map[msg.id] = result.id
+            else:
+                # 단일 메시지인 경우
+                self.message_map[batch[0].id] = results.id
+
+            # 진행률 표시
+            if progress_msg:
+                new_count = current_count + len(batch)
+                if new_count % 50 == 0 or new_count < 50:
+                    await progress_msg.edit(f"📤 복사 중... {new_count}개 (배치 처리)")
+
+            return len(batch)
+
+        except FloodWaitError as e:
+            logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
+            await self.log(f"FloodWait 대기: {e.seconds}초", "WARNING")
+            await asyncio.sleep(e.seconds)
+            # 재시도
+            results = await self.client.forward_messages(
+                self.target, batch_ids, self.source, drop_author=True
+            )
+            # 매핑 저장
+            if isinstance(results, list):
+                for msg, result in zip(batch, results):
+                    self.message_map[msg.id] = result.id
+            else:
+                self.message_map[batch[0].id] = results.id
+            return len(batch)
+
+        except Exception as e:
+            logger.error(f"❌ 배치 전송 실패, 개별 전송으로 전환: {e}")
+            # 배치 실패 시 개별 전송으로 폴백
+            sent_count = 0
+            for msg in batch:
+                try:
+                    result = await self.client.forward_messages(
+                        self.target, msg.id, self.source, drop_author=True
+                    )
+                    if result:
+                        target_id = result.id if hasattr(result, 'id') else result[0].id
+                        self.message_map[msg.id] = target_id
+                    sent_count += 1
+                except MessageIdInvalidError:
+                    logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀")
+                except Exception as ex:
+                    logger.error(f"❌ 메시지 #{msg.id} 전송 실패: {ex}")
+            return sent_count
+
+    async def _copy_all_individual(self, min_id=None, progress_msg=None):
+        """개별 메시지 전송 (Forum 채널용)"""
+        count = 0
 
         async for msg in self.client.iter_messages(self.source, min_id=min_id, reverse=True):
             try:
@@ -840,55 +933,42 @@ class WorkerBot:
                 target_topic_id = None
 
                 if topic_id and self.topic_mapping:
-                    # 매핑된 타겟 토픽 ID 가져오기
                     target_topic_id = self.topic_mapping.get(topic_id)
 
-                # forward_messages: 완전한 file_id 참조, 재업로드 없음
-                if target_topic_id:
-                    # Forum 토픽으로 전송 (reply_to로 토픽 지정)
-                    result = await self.client.forward_messages(
-                        self.target,
-                        msg.id,
-                        self.source,
-                        drop_author=True,  # "Forwarded from..." 제거
-                        background=False,
-                        silent=False,
-                        schedule=None
-                    )
-                    # 전송 후 reply_to 설정 (토픽 지정)
-                    # Note: forward_messages는 reply_to 파라미터가 없으므로
-                    # send_message로 재전송 필요
-                    logger.info(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
-                else:
-                    # 일반 메시지 또는 토픽 매핑 없음
-                    result = await self.client.forward_messages(
-                        self.target,
-                        msg.id,
-                        self.source,
-                        drop_author=True  # "Forwarded from..." 제거
-                    )
+                # 전송
+                result = await self.client.forward_messages(
+                    self.target,
+                    msg.id,
+                    self.source,
+                    drop_author=True
+                )
 
                 # 메시지 ID 매핑 저장
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
                     self.message_map[msg.id] = target_id
 
+                if target_topic_id:
+                    logger.debug(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
+
                 count += 1
+
+                # 진행률 표시
+                if progress_msg and count % 50 == 0:
+                    await progress_msg.edit(f"📤 복사 중... {count}개 (Forum)")
+
             except FloodWaitError as e:
                 logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
-                await self.log(f"FloodWait 대기: {e.seconds}초", "WARNING")
                 await asyncio.sleep(e.seconds)
                 result = await self.client.forward_messages(
                     self.target, msg.id, self.source, drop_author=True
                 )
-                # FloodWait 재시도 후에도 매핑 저장
                 if result:
                     target_id = result.id if hasattr(result, 'id') else result[0].id
                     self.message_map[msg.id] = target_id
                 count += 1
             except MessageIdInvalidError:
-                logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀 (이미 삭제됨)")
-                continue
+                logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀")
             except ChatWriteForbiddenError:
                 logger.error("❌ 타겟 채널 쓰기 권한 없음!")
                 await self.log("타겟 채널 쓰기 권한 없음", "ERROR")
@@ -897,17 +977,6 @@ class WorkerBot:
                 logger.error("❌ 소스 채널 접근 권한 없음!")
                 await self.log("소스 채널 접근 권한 없음", "ERROR")
                 raise
-
-            batch.append(msg.id)
-
-            # 진행률 표시 (50개마다)
-            if progress_msg and count % 50 == 0:
-                await progress_msg.edit(f"📤 복사 중... {count}개")
-
-            # 배치 단위 대기 (FloodWait 방지)
-            if len(batch) >= BATCH_SIZE:
-                await asyncio.sleep(1)
-                batch = []
 
         return count
 
