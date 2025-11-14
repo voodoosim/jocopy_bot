@@ -6,7 +6,14 @@ from typing import Dict
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
-from telethon.tl.functions.channels import CreateForumTopicRequest, GetForumTopicsRequest
+from telethon.tl.functions.channels import (
+    CreateForumTopicRequest,
+    GetForumTopicsRequest,
+    GetFullChannelRequest,
+    CreateChannelRequest,
+    EditPhotoRequest,
+    EditAboutRequest
+)
 from telethon.errors import (
     FloodWaitError,
     MessageIdInvalidError,
@@ -550,6 +557,101 @@ class WorkerBot:
 
             await msg.edit(f"✅ 복사 완료: {count}개")
             await self.log(f"전체 복사 완료: {count}개", "SUCCESS")
+
+        @self.client.on(events.NewMessage(pattern=r'^\.그룹복사$', from_users="me"))
+        async def clone_group(event):
+            """
+            그룹 정보를 복사하여 새 그룹 생성
+            - 제목, 설명, 프로필 사진 복사
+            - 생성된 그룹을 자동으로 target으로 설정
+            - 메시지는 .미러로 별도 복사 필요
+            """
+            if not self.source:
+                return await event.reply("❌ .소스입력 먼저 하세요")
+
+            try:
+                await event.reply("🔄 그룹 정보 복사 시작...")
+
+                # 1. 소스 그룹 정보 가져오기
+                source_entity = await self.client.get_entity(self.source)
+
+                # 채널인 경우
+                if isinstance(source_entity, Channel):
+                    if source_entity.broadcast:
+                        return await event.reply("❌ 채널은 그룹 복사 불가능합니다\n.설정을 사용하세요")
+
+                    # 슈퍼그룹/메가그룹
+                    source_title = source_entity.title
+                    source_about = await self.client.get_entity(self.source)
+                    full_chat = await self.client(GetFullChannelRequest(channel=source_entity))
+                    source_about = full_chat.full_chat.about or ""
+
+                # 일반 그룹
+                elif isinstance(source_entity, Chat):
+                    source_title = source_entity.title
+                    source_about = ""
+
+                else:
+                    return await event.reply("❌ 소스가 그룹이 아닙니다")
+
+                await event.reply(
+                    f"📋 복사할 그룹 정보:\n\n"
+                    f"**제목:** {source_title}\n"
+                    f"**설명:** {source_about[:100]}..." if source_about else "**설명:** (없음)\n"
+                )
+
+                # 2. 새 그룹 생성
+                from telethon.tl.functions.messages import CreateChatRequest
+                from telethon.tl.functions.channels import CreateChannelRequest, EditPhotoRequest, EditAboutRequest
+
+                me = await self.client.get_me()
+
+                # 슈퍼그룹 생성 (메가그룹)
+                result = await self.client(CreateChannelRequest(
+                    title=source_title,
+                    about=source_about,
+                    megagroup=True  # 슈퍼그룹으로 생성
+                ))
+
+                # 생성된 채널 정보
+                new_group = result.chats[0]
+                new_group_id = new_group.id
+
+                await event.reply(f"✅ 그룹 생성 완료: **{source_title}**")
+
+                # 3. 프로필 사진 복사 (선택적)
+                try:
+                    # 소스 프로필 사진 다운로드
+                    photo = await self.client.download_profile_photo(self.source, file=bytes)
+                    if photo:
+                        # 새 그룹에 업로드
+                        uploaded = await self.client.upload_file(photo)
+                        await self.client(EditPhotoRequest(
+                            channel=new_group,
+                            photo=uploaded
+                        ))
+                        await event.reply("✅ 프로필 사진 복사 완료")
+                except Exception as e:
+                    logger.warning(f"프로필 사진 복사 실패: {e}")
+                    await event.reply("⚠️ 프로필 사진 복사 실패 (선택적 기능)")
+
+                # 4. 자동으로 target 설정
+                self.target = new_group
+
+                await event.reply(
+                    f"🎉 **그룹 복사 완료!**\n\n"
+                    f"📂 새 그룹: {source_title}\n"
+                    f"🆔 그룹 ID: `{new_group_id}`\n\n"
+                    f"✅ Target이 자동으로 설정되었습니다\n"
+                    f"💡 이제 `.미러` 명령으로 메시지를 복사하세요"
+                )
+
+                await self.log(f"그룹 복사 완료: {source_title} (ID: {new_group_id})", "SUCCESS")
+
+            except Exception as e:
+                logger.error(f"그룹 복사 실패: {e}", exc_info=True)
+                await event.reply(f"❌ 그룹 복사 실패: {str(e)}")
+                await self.log(f"그룹 복사 실패: {e}", "ERROR")
 
         @self.client.on(events.NewMessage(pattern=r'^\.지정\s+(\d+)$', from_users="me"))
         async def copy_from(event):
