@@ -710,20 +710,39 @@ class WorkerBot:
 
                 # 메시지 ID 매핑 저장 (편집/삭제 동기화용) - DB에 영구 저장
                 if result:
-                    target_id = result.id if hasattr(result, 'id') else result[0].id
-                    await self._save_mapping(e.message.id, target_id)
-                    logger.debug(f"📝 매핑 저장: {e.message.id} → {target_id}")
+                    if hasattr(result, 'id'):
+                        target_id = result.id
+                    elif isinstance(result, list) and result:
+                        target_id = result[0].id
+                    else:
+                        logger.warning("⚠️ forward_messages returned unexpected type")
+                        target_id = None
+
+                    if target_id:
+                        await self._save_mapping(e.message.id, target_id)
+                        logger.debug(f"📝 매핑 저장: {e.message.id} → {target_id}")
 
             except FloodWaitError as fw:
                 logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
                 await asyncio.sleep(fw.seconds)
-                result = await self.client.forward_messages(
-                    self.target, e.message.id, self.source, drop_author=True
-                )
-                # FloodWait 재시도 후에도 매핑 저장
-                if result:
-                    target_id = result.id if hasattr(result, 'id') else result[0].id
-                    await self._save_mapping(e.message.id, target_id)
+                try:
+                    result = await self.client.forward_messages(
+                        self.target, e.message.id, self.source, drop_author=True
+                    )
+                    # FloodWait 재시도 후에도 매핑 저장
+                    if result:
+                        if hasattr(result, 'id'):
+                            target_id = result.id
+                        elif isinstance(result, list) and result:
+                            target_id = result[0].id
+                        else:
+                            logger.warning("⚠️ 재시도 후 예상치 못한 타입")
+                            target_id = None
+
+                        if target_id:
+                            await self._save_mapping(e.message.id, target_id)
+                except Exception as retry_ex:
+                    logger.error(f"❌ FloodWait 재시도 실패: {retry_ex}")
             except MessageIdInvalidError:
                 logger.warning(f"⚠️ 메시지 #{e.message.id} 건너뜀")
             except ChatWriteForbiddenError:
@@ -762,25 +781,36 @@ class WorkerBot:
                         )
                         await self.log(f"Album 부분 전송: {len(target_messages)}/{len(e.messages)}", "WARNING")
 
-                    # zip으로 매핑 저장
-                    for source_msg, target_msg in zip(e.messages, target_messages):
-                        await self._save_mapping(source_msg.id, target_msg.id)
-                        logger.debug(f"📝 Album 매핑: {source_msg.id} → {target_msg.id}")
+                    # 안전하게 최소 길이만큼만 매핑
+                    min_len = min(len(e.messages), len(target_messages))
+                    for i in range(min_len):
+                        await self._save_mapping(e.messages[i].id, target_messages[i].id)
+                        logger.debug(f"📝 Album 매핑: {e.messages[i].id} → {target_messages[i].id}")
 
                 logger.info(f"✅ Album 전송 완료: {len(e.messages)}개")
 
             except FloodWaitError as fw:
                 logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
                 await asyncio.sleep(fw.seconds)
-                source_ids = [m.id for m in e.messages]
-                result = await self.client.forward_messages(
-                    self.target, source_ids, self.source, drop_author=True
-                )
-                # FloodWait 재시도 후에도 매핑 저장
-                if result:
-                    target_messages = result if isinstance(result, list) else [result]
-                    for source_msg, target_msg in zip(e.messages, target_messages):
-                        await self._save_mapping(source_msg.id, target_msg.id)
+                try:
+                    source_ids = [m.id for m in e.messages]
+                    result = await self.client.forward_messages(
+                        self.target, source_ids, self.source, drop_author=True
+                    )
+                    # FloodWait 재시도 후에도 매핑 저장
+                    if result:
+                        target_messages = result if isinstance(result, list) else [result]
+
+                        # 크기 불일치 경고
+                        if len(e.messages) != len(target_messages):
+                            logger.warning(f"⚠️ 재시도 후 Album 크기 불일치: {len(target_messages)}/{len(e.messages)}")
+
+                        # 안전하게 최소 길이만큼만 매핑
+                        min_len = min(len(e.messages), len(target_messages))
+                        for i in range(min_len):
+                            await self._save_mapping(e.messages[i].id, target_messages[i].id)
+                except Exception as retry_ex:
+                    logger.error(f"❌ Album FloodWait 재시도 실패: {retry_ex}")
 
             except ChatWriteForbiddenError:
                 logger.error(f"❌ Album 전송 실패 (grouped_id={e.grouped_id}): 타겟 쓰기 권한 없음")
@@ -803,29 +833,43 @@ class WorkerBot:
                 return
 
             # 소스 ID → 타겟 ID 변환 (DB에서 조회)
-            target_ids = []
+            source_to_target = {}  # 매핑을 임시 저장
             for source_id in e.deleted_ids:
                 target_id = await self._get_mapping(source_id)
                 if target_id:
-                    target_ids.append(target_id)
-                    # Bug #5 수정: 삭제 전에 로그
+                    source_to_target[source_id] = target_id
                     logger.debug(f"🗑️ 삭제 매핑: {source_id} → {target_id}")
-                    # DB와 메모리에서 매핑 제거
-                    await self._delete_mapping(source_id)
 
             # 타겟 메시지 삭제
-            if target_ids:
+            if source_to_target:
+                target_ids = list(source_to_target.values())
                 try:
                     await self.client.delete_messages(self.target, target_ids)
                     logger.info(f"🗑️ 메시지 삭제 완료: {len(target_ids)}개")
+
+                    # 삭제 성공 후 매핑 제거
+                    for source_id in source_to_target.keys():
+                        await self._delete_mapping(source_id)
+
                 except FloodWaitError as fw:
                     logger.warning(f"⏰ FloodWait {fw.seconds}초 대기")
                     await asyncio.sleep(fw.seconds)
-                    await self.client.delete_messages(self.target, target_ids)
-                    logger.info(f"🗑️ 메시지 삭제 완료 (재시도): {len(target_ids)}개")
+                    try:
+                        await self.client.delete_messages(self.target, target_ids)
+                        logger.info(f"🗑️ 메시지 삭제 완료 (재시도): {len(target_ids)}개")
+
+                        # 재시도 성공 후 매핑 제거
+                        for source_id in source_to_target.keys():
+                            await self._delete_mapping(source_id)
+                    except Exception as retry_ex:
+                        logger.error(f"❌ 삭제 재시도 실패: {retry_ex}")
+                        await self.log(f"삭제 재시도 실패: {retry_ex}", "ERROR")
+                        # 재시도 실패 시 매핑 유지
+
                 except Exception as ex:
                     logger.error(f"❌ 삭제 동기화 실패: {ex}", exc_info=True)
                     await self.log(f"삭제 동기화 실패: {ex}", "ERROR")
+                    # 삭제 실패 시 매핑은 유지 (재시도 가능하도록)
             else:
                 logger.debug(f"⚠️ 삭제할 메시지 매핑 없음: {e.deleted_ids}")
 
@@ -1155,12 +1199,26 @@ class WorkerBot:
 
             # 메시지 ID 매핑 저장 - DB에 영구 저장
             # results는 단일 Message or Message 리스트
-            if isinstance(results, list):
-                for msg, result in zip(batch, results):
-                    await self._save_mapping(msg.id, result.id)
+            if results:
+                if isinstance(results, list):
+                    if results:  # 빈 리스트 체크
+                        # 크기 불일치 경고
+                        if len(batch) != len(results):
+                            logger.warning(
+                                f"⚠️ 배치 크기 불일치: 전송 {len(batch)}개, 수신 {len(results)}개"
+                            )
+
+                        # 안전하게 최소 길이만큼만 매핑
+                        min_len = min(len(batch), len(results))
+                        for i in range(min_len):
+                            await self._save_mapping(batch[i].id, results[i].id)
+                    else:
+                        logger.warning("⚠️ forward_messages returned empty list")
+                else:
+                    # 단일 메시지인 경우
+                    await self._save_mapping(batch[0].id, results.id)
             else:
-                # 단일 메시지인 경우
-                await self._save_mapping(batch[0].id, results.id)
+                logger.warning("⚠️ forward_messages returned None")
 
             # 진행률 표시
             if progress_msg:
@@ -1175,16 +1233,40 @@ class WorkerBot:
             await self.log(f"FloodWait 대기: {e.seconds}초", "WARNING")
             await asyncio.sleep(e.seconds)
             # 재시도
-            results = await self.client.forward_messages(
-                self.target, batch_ids, self.source, drop_author=True
-            )
-            # 매핑 저장 - DB에 영구 저장
-            if isinstance(results, list):
-                for msg, result in zip(batch, results):
-                    await self._save_mapping(msg.id, result.id)
-            else:
-                await self._save_mapping(batch[0].id, results.id)
-            return len(batch)
+            try:
+                results = await self.client.forward_messages(
+                    self.target, batch_ids, self.source, drop_author=True
+                )
+                # 매핑 저장 - DB에 영구 저장
+                if results:
+                    if isinstance(results, list):
+                        if results:  # 빈 리스트 체크
+                            # 크기 불일치 경고
+                            if len(batch) != len(results):
+                                logger.warning(
+                                    f"⚠️ 재시도 후 배치 크기 불일치: 전송 {len(batch)}개, 수신 {len(results)}개"
+                                )
+
+                            # 안전하게 최소 길이만큼만 매핑
+                            min_len = min(len(batch), len(results))
+                            for i in range(min_len):
+                                await self._save_mapping(batch[i].id, results[i].id)
+                        else:
+                            logger.warning("⚠️ 재시도 후 빈 리스트 반환")
+                    else:
+                        await self._save_mapping(batch[0].id, results.id)
+                else:
+                    logger.warning("⚠️ 재시도 후 None 반환")
+                return len(batch)
+            except MessageIdInvalidError:
+                logger.warning("⚠️ 재시도 실패: 메시지 삭제됨")
+                return 0
+            except ChatWriteForbiddenError:
+                logger.error("❌ 재시도 실패: 쓰기 권한 없음")
+                raise
+            except Exception as retry_ex:
+                logger.error(f"❌ 재시도 실패: {retry_ex}")
+                raise
 
         except Exception as e:
             logger.error(f"❌ 배치 전송 실패, 개별 전송으로 전환: {e}")
@@ -1196,7 +1278,14 @@ class WorkerBot:
                         self.target, msg.id, self.source, drop_author=True
                     )
                     if result:
-                        target_id = result.id if hasattr(result, 'id') else result[0].id
+                        if hasattr(result, 'id'):
+                            target_id = result.id
+                        elif isinstance(result, list) and result:
+                            target_id = result[0].id
+                        else:
+                            logger.warning(f"⚠️ Unexpected result type for msg #{msg.id}")
+                            continue
+
                         await self._save_mapping(msg.id, target_id)
                         sent_count += 1
                 except MessageIdInvalidError:
@@ -1228,13 +1317,21 @@ class WorkerBot:
 
                 # 메시지 ID 매핑 저장 - DB에 영구 저장
                 if result:
-                    target_id = result.id if hasattr(result, 'id') else result[0].id
+                    if hasattr(result, 'id'):
+                        target_id = result.id
+                    elif isinstance(result, list) and result:
+                        target_id = result[0].id
+                    else:
+                        logger.warning(f"⚠️ Unexpected result type for msg #{msg.id}")
+                        continue
+
                     await self._save_mapping(msg.id, target_id)
+                    count += 1  # 매핑 저장 성공 시에만 count 증가
 
-                if target_topic_id:
-                    logger.debug(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
-
-                count += 1
+                    if target_topic_id:
+                        logger.debug(f"토픽 메시지 복사: #{msg.id} → 토픽 #{target_topic_id}")
+                else:
+                    logger.warning(f"⚠️ forward_messages returned None for msg #{msg.id}")
 
                 # 진행률 표시
                 if progress_msg and count % 50 == 0:
@@ -1243,13 +1340,23 @@ class WorkerBot:
             except FloodWaitError as e:
                 logger.warning(f"⏰ FloodWait {e.seconds}초 대기 중...")
                 await asyncio.sleep(e.seconds)
-                result = await self.client.forward_messages(
-                    self.target, msg.id, self.source, drop_author=True
-                )
-                if result:
-                    target_id = result.id if hasattr(result, 'id') else result[0].id
-                    await self._save_mapping(msg.id, target_id)
-                count += 1
+                try:
+                    result = await self.client.forward_messages(
+                        self.target, msg.id, self.source, drop_author=True
+                    )
+                    if result:
+                        if hasattr(result, 'id'):
+                            target_id = result.id
+                        elif isinstance(result, list) and result:
+                            target_id = result[0].id
+                        else:
+                            logger.warning(f"⚠️ 재시도 후 예상치 못한 타입: msg #{msg.id}")
+                            continue
+
+                        await self._save_mapping(msg.id, target_id)
+                        count += 1  # 재시도 성공 시에도 count 증가
+                except Exception as retry_ex:
+                    logger.error(f"❌ FloodWait 재시도 실패 (msg #{msg.id}): {retry_ex}")
             except MessageIdInvalidError:
                 logger.warning(f"⚠️ 메시지 #{msg.id} 건너뜀")
             except ChatWriteForbiddenError:
